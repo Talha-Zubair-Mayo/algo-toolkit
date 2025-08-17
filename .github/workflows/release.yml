@@ -1,0 +1,119 @@
+name: Publish on main
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  publish:
+    # don't re-run on our own bump commit
+    if: github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip ci]')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # we need full history + tags
+          persist-credentials: false
+
+      - name: Setup Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org/"
+          cache: "npm"
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Build
+        run: npm run build --if-present
+
+      - name: Decide version (bump until tag AND npm are free)
+        id: ver
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          PKG_NAME=$(node -p "require('./package.json').name")
+          CANDIDATE=$(node -p "require('./package.json').version")
+
+          echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
+
+          # make sure we see all remote tags
+          git fetch --tags --force
+
+          BUMPED=false
+          while :; do
+            TAG="v$CANDIDATE"
+
+            # bump if the git tag already exists
+            if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+              echo "Tag $TAG already exists → bumping patch…"
+              npm version patch --no-git-tag-version
+              CANDIDATE=$(node -p "require('./package.json').version")
+              BUMPED=true
+              continue
+            fi
+
+            # bump if npm already has this version
+            if npm view "$PKG_NAME@$CANDIDATE" version >/dev/null 2>&1; then
+              echo "npm $PKG_NAME@$CANDIDATE already exists → bumping patch…"
+              npm version patch --no-git-tag-version
+              CANDIDATE=$(node -p "require('./package.json').version")
+              BUMPED=true
+              continue
+            fi
+
+            # free to use
+            break
+          done
+
+          echo "✅ Using version $CANDIDATE"
+          echo "version=$CANDIDATE" >> "$GITHUB_OUTPUT"
+          echo "tag=v$CANDIDATE" >> "$GITHUB_OUTPUT"
+          echo "bumped=$BUMPED" >> "$GITHUB_OUTPUT"
+
+      - name: Commit bump (if any)
+        if: steps.ver.outputs.bumped == 'true'
+        run: |
+          git add package.json package-lock.json 2>/dev/null || true
+          git commit -m "chore(release): v${{ steps.ver.outputs.version }} [skip ci]"
+
+      - name: Create tag
+        run: |
+          git tag -a "${{ steps.ver.outputs.tag }}" -m "chore(release): ${{ steps.ver.outputs.tag }} [skip ci]"
+
+      - name: Push commit + tag (using PAT)
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git push origin HEAD:main --tags
+
+      - name: Create GitHub Release (auto notes)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: Release ${{ steps.ver.outputs.tag }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }} # action expects env var named GITHUB_TOKEN
+
+      - name: Publish to npm (with provenance)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --provenance

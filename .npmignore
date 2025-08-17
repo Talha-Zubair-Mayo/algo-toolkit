@@ -1,0 +1,8 @@
+src
+node_modules
+*.log
+*.tsbuildinfo
+tsconfig.json
+tsup.config.ts
+.github
+.gitignore
